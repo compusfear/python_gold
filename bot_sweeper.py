@@ -10,13 +10,13 @@ import httpx
 from flask import Flask
 
 # ==============================================================================
-# 1. MINI SERVIDOR HTTP PARA RENDER
+# 1. MINI SERVIDOR HTTP PARA RENDER (CAPTURA TODAS LAS RUTAS)
 # ==============================================================================
 app = Flask(__name__)
+
 @app.route('/', defaults={'path': ''})
-@app.route('/<path:path>'
-@app.route('/')
-def home():
+@app.route('/<path:path>')
+def catch_all(path):
     return "Bot Sweeper QUANT v3 Multi-TF activo y escuchando el mercado.", 200
 
 def iniciar_servidor_web():
@@ -27,8 +27,9 @@ def iniciar_servidor_web():
 # 2. CONFIGURACIÓN Y PARÁMETROS
 # ==============================================================================
 SYMBOL = "GC=F"         # Futuros del Oro (XAUUSD)
-# Lista de temporalidades requeridas (formato compatible con Yahoo Finance / yfinance)
-TIMEFRAMES = ["3m", "5m", "15m", "30m", "1h", "4h", "1d", "1wk", "1mo"]
+
+# Lista completa de Timeframes solicitados
+TIMEFRAMES = ["2m", "5m", "15m", "30m", "60m", "3h", "4h", "1d", "1wk", "1mo"]
 
 TF1 = "1h"
 TF2 = "4h"
@@ -96,25 +97,45 @@ def obtener_pivotes(df: pd.DataFrame, left: int, right: int):
     return pd.Series(swing_highs, index=df.index).ffill(), pd.Series(swing_lows, index=df.index).ffill()
 
 # ==============================================================================
-# 3. EVALUACIÓN POR TEMPORALIDAD
+# 3. EVALUACIÓN Y RESAMPLING DE TIMEFRAMES
 # ==============================================================================
 def evaluar_tf(tf: str):
-    # Determinar el periodo necesario de descarga según el timeframe
-    periodo = "5d" if tf in ["3m", "5m", "15m", "30m"] else "60d" if tf in ["1h", "4h"] else "2y"
-    
-    df = yf.download(SYMBOL, period=periodo, interval=tf, progress=False)
+    # Determinar qué intervalo descargar de Yahoo Finance
+    if tf in ["2m", "5m", "15m", "30m"]:
+        intervalo_yf = tf
+        periodo = "5d"
+    elif tf in ["60m", "3h", "4h"]:
+        intervalo_yf = "60m"
+        periodo = "60d"
+    else:
+        intervalo_yf = tf
+        periodo = "2y"
+        
+    df = yf.download(SYMBOL, period=periodo, interval=intervalo_yf, progress=False)
     df_tf1 = yf.download(SYMBOL, period="60d", interval=TF1, progress=False)
     df_tf2 = yf.download(SYMBOL, period="120d", interval=TF2, progress=False)
     
     if df.empty or df_tf1.empty or df_tf2.empty:
         return
 
+    # Limpiar jerarquía de columnas si yfinance devuelve MultiIndex
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
         df_tf1.columns = df_tf1.columns.get_level_values(0)
         df_tf2.columns = df_tf2.columns.get_level_values(0)
 
-    # Filtro Macro (TF1 / TF2)
+    # Resampling personalizado para 3H y 4H desde las velas de 1H
+    if tf in ["3h", "4h"]:
+        rule = "3h" if tf == "3h" else "4h"
+        df = df.resample(rule).agg({
+            'Open': 'first',
+            'High': 'max',
+            'Low': 'min',
+            'Close': 'last',
+            'Volume': 'sum'
+        }).dropna()
+
+    # Filtro Macro Trend (TF1 / TF2)
     df_tf1['EMA'] = ta.ema(df_tf1['Close'], length=EMA_LEN)
     df_tf2['EMA'] = ta.ema(df_tf2['Close'], length=EMA_LEN)
     
@@ -137,7 +158,7 @@ def evaluar_tf(tf: str):
     veto_long = (vol_htf > vol_ma * MULT_VOL) and (clv_htf < -CLV_MIN)
     veto_short = (vol_htf > vol_ma * MULT_VOL) and (clv_htf > CLV_MIN)
 
-    # Cálculo en TF Específico
+    # Cálculo técnico en el DataFrame del Timeframe objetivo
     df['CLV'] = calcular_clv(df)
     df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
     df['SwingHigh'], df['SwingLow'] = obtener_pivotes(df, LEN_PIVOTE, LEN_PIVOTE)
@@ -146,7 +167,7 @@ def evaluar_tf(tf: str):
         return
 
     c_vela, p_vela = df.iloc[-2], df.iloc[-3]
-    en_sesion = esta_en_sesion(df.index[-2]) if tf in ["3m", "5m", "15m", "30m", "1h"] else True
+    en_sesion = esta_en_sesion(df.index[-2]) if tf in ["2m", "5m", "15m", "30m", "60m"] else True
     
     clv_trig = c_vela['CLV']
     disp_alc, disp_baj = clv_trig >= CLV_TRIG_MIN, clv_trig <= -CLV_TRIG_MIN
@@ -160,8 +181,20 @@ def evaluar_tf(tf: str):
     sig_long = en_sesion and (not veto_long) and tend_alc and disp_alc and ((MODO_BARRIDO and sweep_low) or (MODO_BOS and bos_up))
     sig_short = en_sesion and (not veto_short) and tend_baj and disp_baj and ((MODO_BARRIDO and sweep_high) or (MODO_BOS and bos_dn))
 
-    # Formatear TF para el mensaje
-    tf_label = tf.upper().replace("WK", "W").replace("MO", "M")
+    # Mapeo de etiqueta limpia para el mensaje de Telegram
+    tf_map = {
+        "2m": "3M",
+        "5m": "5M",
+        "15m": "15M",
+        "30m": "30M",
+        "60m": "1H",
+        "3h": "3H",
+        "4h": "4H",
+        "1d": "1D",
+        "1wk": "1W",
+        "1mo": "1M"
+    }
+    tf_label = tf_map.get(tf, tf.upper())
 
     if sig_long:
         tipo = "BARRIDO LONG" if (MODO_BARRIDO and sweep_low) else "🚀 CONTINUACIÓN LONG"
@@ -202,7 +235,7 @@ def analizar_mercado():
             print(f"Error evaluando TF {tf}: {e}")
 
 # ==============================================================================
-# 4. BUCLE PRINCIPAL
+# 4. BUCLE PRINCIPAL CON MULTITHREADING
 # ==============================================================================
 if __name__ == "__main__":
     t = threading.Thread(target=iniciar_servidor_web, daemon=True)
@@ -214,5 +247,5 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Error en bucle principal: {e}")
         
-        # Escanea todas las temporalidades cada 3 minutos
+        # Bucle de escaneo cada 3 minutos (180 segundos)
         time.sleep(180)
