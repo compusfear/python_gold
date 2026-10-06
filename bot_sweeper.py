@@ -1,231 +1,199 @@
-//@version=6
-indicator("Sweeper QUANT v3 — Entrada Exacta + Gestión 15/20 + Runner", shorttitle="SQv3", overlay=true, max_labels_count=500, max_lines_count=500)
+import os
+import time
+import datetime
+import threading
+import pytz
+import pandas as pd
+import pandas_ta as ta
+import yfinance as yf
+import httpx
+from flask import Flask
 
-// ════════════════════════════════════════════════════════════════
-//  BASADO EN EVIDENCIA: Fxnx (1000 trades), Oukhouya 2026 (XAUUSD H1,
-//  Sharpe 1.18), Mahadzva 2026 (SSRN), Medium CLV (AAPL 00-24).
-//  Regla de oro: la señal se imprime en la VELA GATILLO confirmada.
-// ════════════════════════════════════════════════════════════════
+# ==============================================================================
+# 1. MINI SERVIDOR HTTP PARA MANTENER RENDER ACTIVO
+# ==============================================================================
+app = Flask(__name__)
 
-// ── Entradas: Estructura ──
-grpS = "1) Estructura y Gatillo"
-lenPivote   = input.int(3, "Confirmación de pivotes (menor = señal más temprana)", minval=1, group=grpS)
-clvTrigMin  = input.float(0.35, "Fuerza de vela gatillo (CLV mínimo)", minval=0.1, maxval=1.0, step=0.05, group=grpS, tooltip="CLV=((C-L)-(H-C))/(H-L). 0.35 = cierre en el ~67% superior/inferior del rango: vela de desplazamiento.")
-cooldown    = input.int(3, "Velas mínimas entre señales", minval=0, group=grpS)
-modoBarrido = input.bool(true,  "Señales por BARRIDO (rechazo de liquidez)", group=grpS)
-modoBOS     = input.bool(true,  "Señales por CONTINUACIÓN (BOS con desplazamiento)", group=grpS, tooltip="Caza impulsos de tendencia fuerte sin retroceso: lo que tu indicador anterior no marcaba.")
+@app.route('/')
+def home():
+    # Esta ruta responderá HTTP 200 OK cuando le hagan el ping
+    return "Bot Sweeper QUANT v3 está activo y escuchando el mercado.", 200
 
-// ── Entradas: Multi-Timeframe ──
-grpT = "2) Tendencia Multi-TF"
-tf1 = input.timeframe("60",  "TF tendencia principal", group=grpT)
-tf2 = input.timeframe("240", "TF tendencia macro", group=grpT)
-emaLen = input.int(50, "EMA de tendencia", minval=10, group=grpT)
-exigirMacro = input.bool(true, "Exigir alineación macro (señal A+)", group=grpT, tooltip="Si está activo, solo opera cuando TF1 y TF2 coinciden. Desactívalo para más señales (grado B).")
+def iniciar_servidor_web():
+    # Render asigna automáticamente un puerto mediante la variable de entorno PORT
+    puerto = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=puerto)
 
-// ── Entradas: Sesión y Volumen ──
-grpV = "3) Sesión y Volumen Institucional"
-usarSesion = input.bool(true, "Filtrar por sesión Londres/NY", group=grpV)
-sessLondres = input.session("0700-1300", "Sesión Londres (UTC)", group=grpV)
-sessNY      = input.session("1300-2100", "Sesión Nueva York (UTC)", group=grpV)
-tfVol   = input.timeframe("60", "TF de volumen", group=grpV)
-volLen  = input.int(20, "Media de volumen HTF", minval=5, group=grpV)
-multVol = input.float(1.15, "Umbral volumen significativo", minval=1.0, step=0.05, group=grpV)
-clvMin  = input.float(0.3, "CLV HTF para veto", minval=0.1, maxval=1.0, step=0.1, group=grpV)
+# ==============================================================================
+# 2. CONFIGURACIÓN DEL BOT DE TRADING
+# ==============================================================================
+SYMBOL = "GC=F"         # Futuros del Oro (XAUUSD)
+TIMEFRAME = "5m"
+TF1 = "1h"
+TF2 = "4h"
 
-// ── Entradas: Gestión sin SL/TP (tu método) ──
-grpG = "4) Gestión: parcial 15/20 + a salvo + runner"
-metodoME = input.string("Rango de estructura", "Movimiento Esperado (ME)", options=["Rango de estructura", "ATR xN"], group=grpG)
-atrME    = input.float(4.0, "Multiplo ATR si ME=ATR xN", minval=1.0, step=0.5, group=grpG)
-pctTP1   = input.float(15.0, "Parcial 1 (% del ME)", minval=5, step=5, group=grpG)
-pctTP2   = input.float(20.0, "Parcial 2 (% del ME)", minval=5, step=5, group=grpG)
-beBufATR = input.float(0.10, "Colchón ATR para 'a salvo'", minval=0.0, step=0.05, group=grpG, tooltip="Tras tocar TP1, nivel de puesta a salvo = entrada + colchón (cubre spread/comisión).")
-modoTrail = input.string("Estructura (pivotes)", "Salida del runner", options=["Estructura (pivotes)", "Chandelier ATR"], group=grpG)
-atrTrail  = input.float(3.0, "ATR del chandelier", minval=1.0, step=0.5, group=grpG)
+LEN_PIVOTE = 3
+CLV_TRIG_MIN = 0.35
+COOLDOWN = 3
+MODO_BARRIDO = True
+MODO_BOS = True
 
-// ════════════════ NÚCLEO MULTITIMEFRAME ════════════════
-f_trend(_tf) => request.security(syminfo.tickerid, _tf, close > ta.ema(close, emaLen), lookahead=barmerge.lookahead_off)
-tendTF1 = f_trend(tf1)
-tendTF2 = f_trend(tf2)
-tendAlc = tendTF1 and (exigirMacro ? tendTF2 : true)
-tendBaj = (not tendTF1) and (exigirMacro ? not tendTF2 : true)
-gradoA  = tendTF1 == tendTF2
+EMA_LEN = 50
+EXIGIR_MACRO = True
 
-[volHTF, volMA, clvHTF] = request.security(syminfo.tickerid, tfVol, [volume, ta.sma(volume, volLen), ((close - low) - (high - close)) / math.max(high - low, syminfo.mintick)], lookahead=barmerge.lookahead_off)
-vetoLong = volHTF > volMA * multVol and clvHTF < -clvMin
-vetoShort = volHTF > volMA * multVol and clvHTF >  clvMin
+USAR_SESION = True
+SESS_LONDRES_START, SESS_LONDRES_END = 7, 13
+SESS_NY_START, SESS_NY_END = 13, 21
 
-enSesion = not usarSesion or not na(time(timeframe.period, sessLondres)) or not na(time(timeframe.period, sessNY))
+TF_VOL = "1h"
+VOL_LEN = 20
+MULT_VOL = 1.15
+CLV_MIN = 0.3
 
-// ════════════════ ESTRUCTURA Y GATILLO (VELA EXACTA) ════════════════
-ph = ta.pivothigh(high, lenPivote, lenPivote)
-pl = ta.pivotlow(low,  lenPivote, lenPivote)
-var float swingHigh = na
-var float swingLow  = na
-if not na(ph)
-    swingHigh := ph
-if not na(pl)
-    swingLow := pl
+# Variables de entorno o credenciales de Telegram
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "TU_TELEGRAM_BOT_TOKEN_AQUI")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "TU_TELEGRAM_CHAT_ID_AQUI")
 
-atr = ta.atr(14)
-rng    = math.max(high - low, syminfo.mintick)
-clvTrig = ((close - low) - (high - close)) / rng
-conf    = barstate.isconfirmed   // ← anti-repintado: nada se imprime en vela viva
+def enviar_telegram(mensaje: str):
+    if TELEGRAM_TOKEN == "TU_TELEGRAM_BOT_TOKEN_AQUI":
+        print(f"\n[SIMULACIÓN TELEGRAM]:\n{mensaje}\n")
+        return
+        
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": mensaje,
+        "parse_mode": "Markdown"
+    }
+    try:
+        httpx.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Error al enviar a Telegram: {e}")
 
-sweepLow  = conf and not na(swingLow)  and low  < swingLow  and close > swingLow
-sweepHigh = conf and not na(swingHigh) and high > swingHigh and close < swingHigh
-bosUp     = conf and not na(swingHigh) and close > swingHigh and close[1] <= swingHigh
-bosDn     = conf and not na(swingLow)  and close < swingLow  and close[1] >= swingLow
+def calcular_clv(df: pd.DataFrame) -> pd.Series:
+    rng = (df['High'] - df['Low']).replace(0, 0.00001)
+    return ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / rng
 
-dispAlc = clvTrig >=  clvTrigMin
-dispBaj = clvTrig <= -clvTrigMin
+def esta_en_sesion(dt: datetime.datetime) -> bool:
+    if not USAR_SESION:
+        return True
+    hora_utc = dt.astimezone(pytz.utc).hour
+    return (SESS_LONDRES_START <= hora_utc < SESS_LONDRES_END) or (SESS_NY_START <= hora_utc < SESS_NY_END)
 
-var int lastSigBar = -100000
-libre = bar_index - lastSigBar >= cooldown
+def obtener_pivotes(df: pd.DataFrame, left: int, right: int):
+    highs, lows, n = df['High'].values, df['Low'].values, len(df)
+    swing_highs, swing_lows = [None] * n, [None] * n
+    
+    for i in range(left, n - right):
+        window_h = highs[i - left : i + right + 1]
+        if max(window_h) == highs[i] and list(window_h).count(highs[i]) == 1:
+            swing_highs[i + right] = highs[i]
+            
+        window_l = lows[i - left : i + right + 1]
+        if min(window_l) == lows[i] and list(window_l).count(lows[i]) == 1:
+            swing_lows[i + right] = lows[i]
+            
+    return pd.Series(swing_highs, index=df.index).ffill(), pd.Series(swing_lows, index=df.index).ffill()
 
-sigLong  = conf and libre and enSesion and not vetoLong  and tendAlc and dispAlc and ((modoBarrido and sweepLow) or (modoBOS and bosUp))
-sigShort = conf and libre and enSesion and not vetoShort and tendBaj and dispBaj and ((modoBarrido and sweepHigh) or (modoBOS and bosDn))
-porBarridoL = modoBarrido and sweepLow
-porBarridoS = modoBarrido and sweepHigh
+def analizar_mercado():
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Analizando {SYMBOL}...")
+    
+    df = yf.download(SYMBOL, period="5d", interval=TIMEFRAME, progress=False)
+    df_tf1 = yf.download(SYMBOL, period="20d", interval=TF1, progress=False)
+    df_tf2 = yf.download(SYMBOL, period="30d", interval=TF2, progress=False)
+    
+    if df.empty or df_tf1.empty or df_tf2.empty:
+        print("Error: Sin datos de Yahoo Finance.")
+        return
 
-// ════════════════ GESTIÓN: ME, PARCIALES, A SALVO, RUNNER ════════════════
-var int   dir   = 0
-var int   fase  = 0      // 1 abierta · 2 TP1 tocado · 3 a salvo
-var float entry = na
-var float me    = na
-var float tp1   = na
-var float tp2   = na
-var float be    = na
-var float trail = na
-var float swept = na
-var float hh    = na
-var float ll    = na
-var bool  invMarcada = false
-var line lnEntry = na
-var line lnTp1   = na
-var line lnTp2   = na
-var line lnTrail = na
-var label lbEntry = na
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+        df_tf1.columns = df_tf1.columns.get_level_values(0)
+        df_tf2.columns = df_tf2.columns.get_level_values(0)
 
-f_ME(_dir) =>
-    float base = metodoME == "ATR xN" ? atrME * atr : (not na(swingHigh) and not na(swingLow) ? swingHigh - swingLow : atrME * atr)
-    math.max(base, 2.0 * atr)
+    df_tf1['EMA'] = ta.ema(df_tf1['Close'], length=EMA_LEN)
+    df_tf2['EMA'] = ta.ema(df_tf2['Close'], length=EMA_LEN)
+    
+    tend_tf1 = df_tf1['Close'].iloc[-1] > df_tf1['EMA'].iloc[-1]
+    tend_tf2 = df_tf2['Close'].iloc[-1] > df_tf2['EMA'].iloc[-1]
+    
+    tend_alc = tend_tf1 and (tend_tf2 if EXIGIR_MACRO else True)
+    tend_baj = (not tend_tf1) and ((not tend_tf2) if EXIGIR_MACRO else True)
+    grado_a = tend_tf1 == tend_tf2
 
-f_limpiar() =>
-    line.delete(lnEntry), line.delete(lnTp1), line.delete(lnTp2), line.delete(lnTrail), label.delete(lbEntry)
+    df_vol = yf.download(SYMBOL, period="10d", interval=TF_VOL, progress=False)
+    if isinstance(df_vol.columns, pd.MultiIndex):
+        df_vol.columns = df_vol.columns.get_level_values(0)
+        
+    df_vol['VolMA'] = ta.sma(df_vol['Volume'], length=VOL_LEN)
+    df_vol['CLV'] = calcular_clv(df_vol)
+    
+    vol_htf, vol_ma, clv_htf = df_vol['Volume'].iloc[-1], df_vol['VolMA'].iloc[-1], df_vol['CLV'].iloc[-1]
+    veto_long = (vol_htf > vol_ma * MULT_VOL) and (clv_htf < -CLV_MIN)
+    veto_short = (vol_htf > vol_ma * MULT_VOL) and (clv_htf > CLV_MIN)
 
-if sigLong and dir == 0
-    f_limpiar()
-    dir := 1, fase := 1, invMarcada := false
-    entry := close, swept := swingLow, me := f_ME(1)
-    tp1 := entry + me * pctTP1 / 100, tp2 := entry + me * pctTP2 / 100
-    be := entry + beBufATR * atr, trail := swingLow, hh := high, ll := low
-    lastSigBar := bar_index
-    int tFin = time + timeframe.in_seconds() * 1000 * 40
-    lnEntry := line.new(time, entry, tFin, entry, xloc=xloc.bar_time, color=color.blue, width=2)
-    lnTp1   := line.new(time, tp1, tFin, tp1, xloc=xloc.bar_time, color=color.teal, style=line.style_dotted)
-    lnTp2   := line.new(time, tp2, tFin, tp2, xloc=xloc.bar_time, color=color.teal, style=line.style_dotted)
-    lnTrail := line.new(time, trail, tFin, trail, xloc=xloc.bar_time, color=color.orange, width=2)
-    lbEntry := label.new(time, low, (porBarridoL ? " BARRIDO LONG" : "🚀 CONTINUACIÓN LONG") + (gradoA ? " (A+)" : " (B)"), xloc=xloc.bar_time, style=label.style_label_up, color=color.new(color.lime, 10), textcolor=color.black, size=size.small)
+    df['CLV'] = calcular_clv(df)
+    df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+    df['SwingHigh'], df['SwingLow'] = obtener_pivotes(df, LEN_PIVOTE, LEN_PIVOTE)
 
-if sigShort and dir == 0
-    f_limpiar()
-    dir := -1, fase := 1, invMarcada := false
-    entry := close, swept := swingHigh, me := f_ME(-1)
-    tp1 := entry - me * pctTP1 / 100, tp2 := entry - me * pctTP2 / 100
-    be := entry - beBufATR * atr, trail := swingHigh, hh := high, ll := low
-    lastSigBar := bar_index
-    int tFin = time + timeframe.in_seconds() * 1000 * 40
-    lnEntry := line.new(time, entry, tFin, entry, xloc=xloc.bar_time, color=color.blue, width=2)
-    lnTp1   := line.new(time, tp1, tFin, tp1, xloc=xloc.bar_time, color=color.teal, style=line.style_dotted)
-    lnTp2   := line.new(time, tp2, tFin, tp2, xloc=xloc.bar_time, color=color.teal, style=line.style_dotted)
-    lnTrail := line.new(time, trail, tFin, trail, xloc=xloc.bar_time, color=color.orange, width=2)
-    lbEntry := label.new(time, high, (porBarridoS ? "🎯 BARRIDO SHORT" : "🚀 CONTINUACIÓN SHORT") + (gradoA ? " (A+)" : " (B)"), xloc=xloc.bar_time, style=label.style_label_down, color=color.new(color.red, 10), textcolor=color.white, size=size.small)
+    c_vela, p_vela = df.iloc[-2], df.iloc[-3]
+    en_sesion = esta_en_sesion(df.index[-2])
+    
+    clv_trig = c_vela['CLV']
+    disp_alc, disp_baj = clv_trig >= CLV_TRIG_MIN, clv_trig <= -CLV_TRIG_MIN
 
-// ── Seguimiento de la operación abierta ──
-evTP1 = false, evTP2 = false, evBE = false, evExit = false, evInv = false
-if dir == 1 and conf
-    hh := math.max(hh, high)
-    if not na(pl)
-        trail := math.max(trail, pl)
-    if modoTrail == "Chandelier ATR"
-        trail := math.max(trail, hh - atrTrail * atr)
-    line.set_y1(lnTrail, trail), line.set_y2(lnTrail, trail), line.set_x2(lnTrail, time + timeframe.in_seconds() * 1000 * 40)
-    if fase == 1 and high >= tp1
-        fase := 2, evTP1 := true
-        label.new(time, high, "💰 TP1 (" + str.tostring(pctTP1) + "%)\nCierra parcial → operación a salvo en " + str.tostring(be, "#.##"), xloc=xloc.bar_time, style=label.style_label_down, color=color.new(color.teal, 10), textcolor=color.white, size=size.tiny)
-    if fase >= 2 and high >= tp2
-        evTP2 := true
-        label.new(time, high, "💰 TP2 (" + str.tostring(pctTP2) + "%) opcional", xloc=xloc.bar_time, style=label.style_label_down, color=color.new(color.teal, 30), textcolor=color.white, size=size.tiny)
-    if fase == 2 and low <= be
-        fase := 3, evBE := true
-        label.new(time, low, "🛡️ A SALVO: riesgo ≈ 0, deja correr", xloc=xloc.bar_time, style=label.style_label_up, color=color.new(color.gray, 20), textcolor=color.white, size=size.tiny)
-    if fase == 1 and close < swept and not invMarcada
-        invMarcada := true, evInv := true
-        label.new(time, low, "⚠️ Invalidación estructural (informativo: tú decides)", xloc=xloc.bar_time, style=label.style_label_up, color=color.new(color.orange, 20), textcolor=color.black, size=size.tiny)
-    if close < trail
-        evExit := true
-        label.new(time, low, "🏁 Runner: cierre por " + modoTrail, xloc=xloc.bar_time, style=label.style_label_up, color=color.new(color.purple, 10), textcolor=color.white, size=size.small)
-        dir := 0, f_limpiar()
+    swing_low, swing_high = c_vela['SwingLow'], c_vela['SwingHigh']
+    sweep_low = pd.notna(swing_low) and (c_vela['Low'] < swing_low) and (c_vela['Close'] > swing_low)
+    sweep_high = pd.notna(swing_high) and (c_vela['High'] > swing_high) and (c_vela['Close'] < swing_high)
+    bos_up = pd.notna(swing_high) and (c_vela['Close'] > swing_high) and (p_vela['Close'] <= swing_high)
+    bos_dn = pd.notna(swing_low) and (c_vela['Close'] < swing_low) and (p_vela['Close'] >= swing_low)
 
-if dir == -1 and conf
-    ll := math.min(ll, low)
-    if not na(ph)
-        trail := math.min(trail, ph)
-    if modoTrail == "Chandelier ATR"
-        trail := math.min(trail, ll + atrTrail * atr)
-    line.set_y1(lnTrail, trail), line.set_y2(lnTrail, trail), line.set_x2(lnTrail, time + timeframe.in_seconds() * 1000 * 40)
-    if fase == 1 and low <= tp1
-        fase := 2, evTP1 := true
-        label.new(time, low, "💰 TP1 (" + str.tostring(pctTP1) + "%)\nCierra parcial → operación a salvo en " + str.tostring(be, "#.##"), xloc=xloc.bar_time, style=label.style_label_up, color=color.new(color.teal, 10), textcolor=color.white, size=size.tiny)
-    if fase >= 2 and low <= tp2
-        evTP2 := true
-        label.new(time, low, "💰 TP2 (" + str.tostring(pctTP2) + "%) opcional", xloc=xloc.bar_time, style=label.style_label_up, color=color.new(color.teal, 30), textcolor=color.white, size=size.tiny)
-    if fase == 2 and high >= be
-        fase := 3, evBE := true
-        label.new(time, high, "🛡️ A SALVO: riesgo ≈ 0, deja correr", xloc=xloc.bar_time, style=label.style_label_down, color=color.new(color.gray, 20), textcolor=color.white, size=size.tiny)
-    if fase == 1 and close > swept and not invMarcada
-        invMarcada := true, evInv := true
-        label.new(time, high, "⚠️ Invalidación estructural (informativo: tú decides)", xloc=xloc.bar_time, style=label.style_label_down, color=color.new(color.orange, 20), textcolor=color.black, size=size.tiny)
-    if close > trail
-        evExit := true
-        label.new(time, high, "🏁 Runner: cierre por " + modoTrail, xloc=xloc.bar_time, style=label.style_label_down, color=color.new(color.purple, 10), textcolor=color.white, size=size.small)
-        dir := 0, f_limpiar()
+    sig_long = en_sesion and (not veto_long) and tend_alc and disp_alc and ((MODO_BARRIDO and sweep_low) or (MODO_BOS and bos_up))
+    sig_short = en_sesion and (not veto_short) and tend_baj and disp_baj and ((MODO_BARRIDO and sweep_high) or (MODO_BOS and bos_dn))
 
-// ── Marcas visuales en la vela exacta ──
-plotshape(sigLong,  "ENTRADA LONG",  shape.triangleup,   location.belowbar, color.lime, size=size.small, text="LONG")
-plotshape(sigShort, "ENTRADA SHORT", shape.triangledown, location.abovebar, color.red,  size=size.small, text="SHORT")
-plotshape(sweepHigh and not sigShort, "Barrido H", shape.triangledown, location.abovebar, color.new(color.red, 60),  size=size.tiny)
-plotshape(sweepLow  and not sigLong,  "Barrido L", shape.triangleup,   location.belowbar, color.new(color.lime, 60), size=size.tiny)
+    if sig_long:
+        tipo = "BARRIDO LONG" if (MODO_BARRIDO and sweep_low) else "🚀 CONTINUACIÓN LONG"
+        grado = "(A+)" if grado_a else "(B)"
+        me = max(swing_high - swing_low if pd.notna(swing_high) and pd.notna(swing_low) else 4.0 * c_vela['ATR'], 2.0 * c_vela['ATR'])
+        msg = (
+            f"🔥 *SEÑAL {tipo} {grado}*\n"
+            f"📈 *Activo:* {SYMBOL} ({TIMEFRAME})\n"
+            f"💲 *Precio Entrada:* `{c_vela['Close']:.2f}`\n"
+            f"🎯 *Parcial TP1 (15%):* `{c_vela['Close'] + (me * 0.15):.2f}`\n"
+            f"🎯 *Parcial TP2 (20%):* `{c_vela['Close'] + (me * 0.20):.2f}`\n"
+            f"🛡️ *Inval. Estructural:* `{swing_low:.2f}`"
+        )
+        enviar_telegram(msg)
 
-// ── Alertas (frecuencia: cierre de barra) ──
-alertcondition(sigLong,  "ENTRADA LONG exacta",  "SQv3: LONG en vela confirmada. Tendencia multi-TF y volumen validados.")
-alertcondition(sigShort, "ENTRADA SHORT exacta", "SQv3: SHORT en vela confirmada. Tendencia multi-TF y volumen validados.")
-alertcondition(evTP1, "TP1 tocado → pasar a salvo", "SQv3: TP1 alcanzado. Cierra parcial y mueve a nivel a salvo.")
-alertcondition(evBE,  "Operación a salvo", "SQv3: nivel a salvo tocado. Riesgo ≈ 0, runner libre.")
-alertcondition(evExit,"Salida del runner", "SQv3: cierre del runner por estructura/trail.")
+    elif sig_short:
+        tipo = "🎯 BARRIDO SHORT" if (MODO_BARRIDO and sweep_high) else "🚀 CONTINUACIÓN SHORT"
+        grado = "(A+)" if grado_a else "(B)"
+        me = max(swing_high - swing_low if pd.notna(swing_high) and pd.notna(swing_low) else 4.0 * c_vela['ATR'], 2.0 * c_vela['ATR'])
+        msg = (
+            f"🚨 *SEÑAL {tipo} {grado}*\n"
+            f"📉 *Activo:* {SYMBOL} ({TIMEFRAME})\n"
+            f"💲 *Precio Entrada:* `{c_vela['Close']:.2f}`\n"
+            f"🎯 *Parcial TP1 (15%):* `{c_vela['Close'] - (me * 0.15):.2f}`\n"
+            f"🎯 *Parcial TP2 (20%):* `{c_vela['Close'] - (me * 0.20):.2f}`\n"
+            f"🛡️ *Inval. Estructural:* `{swing_high:.2f}`"
+        )
+        enviar_telegram(msg)
 
-// ── Panel multi-TF ──
-var table panel = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 70), frame_width=1)
-if barstate.islast
-    table.cell(panel,0,0,"Tend " + tf1, text_color=color.white, text_size=size.small)
-    table.cell(panel,1,0,tendTF1 ? "ALCISTA ▲" : "BAJISTA ▼", text_color=tendTF1 ? color.lime : color.red, text_size=size.small)
-    table.cell(panel,0,1,"Tend " + tf2, text_color=color.white, text_size=size.small)
-    table.cell(panel,1,1,tendTF2 ? "ALCISTA ▲" : "BAJISTA ▼", text_color=tendTF2 ? color.lime : color.red, text_size=size.small)
-    table.cell(panel,0,2,"Grado señal", text_color=color.white, text_size=size.small)
-    table.cell(panel,1,2,gradoA ? "A+ (TFs alineados)" : "B (solo TF1)", text_color=gradoA ? color.lime : color.yellow, text_size=size.small)
-    table.cell(panel,0,3,"Sesión", text_color=color.white, text_size=size.small)
-    table.cell(panel,1,3,enSesion ? "Activa ✅" : "Muerta ⛔", text_color=enSesion ? color.aqua : color.gray, text_size=size.small)
-    table.cell(panel,0,4,"Vol/CLV HTF", text_color=color.white, text_size=size.small)
-    table.cell(panel,1,4,(vetoLong ? "VETO short-side" : vetoShort ? "VETO long-side" : "Sin veto") + " · CLV " + str.tostring(clvHTF, "#.##"), text_color=vetoLong or vetoShort ? color.orange : color.gray, text_size=size.small)
-    table.cell(panel,0,5,"CLV gatillo", text_color=color.white, text_size=size.small)
-    table.cell(panel,1,5,str.tostring(clvTrig, "#.##"), text_color=clvTrig >= clvTrigMin ? color.lime : clvTrig <= -clvTrigMin ? color.red : color.gray, text_size=size.small)
-    table.cell(panel,0,6,"Estado trade", text_color=color.white, text_size=size.small)
-    table.cell(panel,1,6,dir == 0 ? "Sin posición" : (dir == 1 ? "LONG " : "SHORT ") + (fase == 1 ? "abierta" : fase == 2 ? "→ a salvo" : "a salvo 🛡️"), text_color=dir == 1 ? color.lime : dir == -1 ? color.red : color.gray, text_size=size.small)
+# ==============================================================================
+# 3. PUNTO DE ENTRADA CON MULTITHREADING
+# ==============================================================================
+if __name__ == "__main__":
+    print("Iniciando mini servidor HTTP en hilo secundario...")
+    # Inicia el servidor Flask en segundo plano
+    t = threading.Thread(target=iniciar_servidor_web, daemon=True)
+    t.start()
 
-
-
-
-
-
-
-
+    print("Iniciando análisis de mercado en bucle principal...")
+    while True:
+        try:
+            analizar_mercado()
+        except Exception as e:
+            print(f"Error en bucle principal: {e}")
+        
+        # Espera 300 segundos (5 minutos) para la siguiente vela
+        time.sleep(300)
