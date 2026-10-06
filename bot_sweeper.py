@@ -13,7 +13,8 @@ from flask import Flask
 # 1. MINI SERVIDOR HTTP PARA RENDER
 # ==============================================================================
 app = Flask(__name__)
-
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>'
 @app.route('/')
 def home():
     return "Bot Sweeper QUANT v3 Multi-TF activo y escuchando el mercado.", 200
