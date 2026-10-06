@@ -1,44 +1,20 @@
 import os
-import time
 import datetime
-import threading
 import pytz
 import pandas as pd
 import pandas_ta as ta
 import yfinance as yf
 import httpx
-from flask import Flask
+from flask import Flask, request, jsonify
 
 # ==============================================================================
-# 1. MINI SERVIDOR HTTP PARA RENDER (CAPTURA TODAS LAS RUTAS)
+# 1. CONFIGURACIÓN Y SERVIDOR FLASK
 # ==============================================================================
 app = Flask(__name__)
 
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
-def catch_all(path):
-    return "Bot Sweeper QUANT v3 Multi-TF activo y escuchando el mercado.", 200
-
-def iniciar_servidor_web():
-    puerto = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=puerto)
-
-# ==============================================================================
-# 2. CONFIGURACIÓN Y PARÁMETROS
-# ==============================================================================
 SYMBOL = "GC=F"         # Futuros del Oro (XAUUSD)
-
-# Lista completa de Timeframes solicitados
-TIMEFRAMES = ["2m", "5m", "15m", "30m", "60m", "3h", "4h", "1d", "1wk", "1mo"]
-
 TF1 = "1h"
 TF2 = "4h"
-
-LEN_PIVOTE = 3
-CLV_TRIG_MIN = 0.35
-MODO_BARRIDO = True
-MODO_BOS = True
-
 EMA_LEN = 50
 EXIGIR_MACRO = True
 
@@ -46,15 +22,12 @@ USAR_SESION = True
 SESS_LONDRES_START, SESS_LONDRES_END = 7, 13
 SESS_NY_START, SESS_NY_END = 13, 21
 
-TF_VOL = "1h"
-VOL_LEN = 20
-MULT_VOL = 1.15
-CLV_MIN = 0.3
-
-# Variables de entorno para Telegram
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "TU_TELEGRAM_BOT_TOKEN_AQUI")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "TU_TELEGRAM_CHAT_ID_AQUI")
 
+# ==============================================================================
+# 2. FUNCIONES AUXILIARES Y NOTIFICACIONES
+# ==============================================================================
 def enviar_telegram(mensaje: str):
     if TELEGRAM_TOKEN == "TU_TELEGRAM_BOT_TOKEN_AQUI":
         print(f"\n[SIMULACIÓN TELEGRAM]:\n{mensaje}\n")
@@ -71,181 +44,120 @@ def enviar_telegram(mensaje: str):
     except Exception as e:
         print(f"Error al enviar a Telegram: {e}")
 
-def calcular_clv(df: pd.DataFrame) -> pd.Series:
-    rng = (df['High'] - df['Low']).replace(0, 0.00001)
-    return ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / rng
-
 def esta_en_sesion(dt: datetime.datetime) -> bool:
     if not USAR_SESION:
         return True
     hora_utc = dt.astimezone(pytz.utc).hour
     return (SESS_LONDRES_START <= hora_utc < SESS_LONDRES_END) or (SESS_NY_START <= hora_utc < SESS_NY_END)
 
-def obtener_pivotes(df: pd.DataFrame, left: int, right: int):
-    highs, lows, n = df['High'].values, df['Low'].values, len(df)
-    swing_highs, swing_lows = [None] * n, [None] * n
-    
-    for i in range(left, n - right):
-        window_h = highs[i - left : i + right + 1]
-        if max(window_h) == highs[i] and list(window_h).count(highs[i]) == 1:
-            swing_highs[i + right] = highs[i]
-            
-        window_l = lows[i - left : i + right + 1]
-        if min(window_l) == lows[i] and list(window_l).count(lows[i]) == 1:
-            swing_lows[i + right] = lows[i]
-            
-    return pd.Series(swing_highs, index=df.index).ffill(), pd.Series(swing_lows, index=df.index).ffill()
+def validar_filtro_macro():
+    """Descarga datos HTF rápidamente para comprobar alineación con la EMA 50."""
+    try:
+        df_tf1 = yf.download(SYMBOL, period="30d", interval=TF1, progress=False)
+        df_tf2 = yf.download(SYMBOL, period="60d", interval=TF2, progress=False)
+
+        if df_tf1.empty or df_tf2.empty:
+            return True, True, True
+
+        if isinstance(df_tf1.columns, pd.MultiIndex):
+            df_tf1.columns = df_tf1.columns.get_level_values(0)
+            df_tf2.columns = df_tf2.columns.get_level_values(0)
+
+        df_tf1['EMA'] = ta.ema(df_tf1['Close'], length=EMA_LEN)
+        df_tf2['EMA'] = ta.ema(df_tf2['Close'], length=EMA_LEN)
+
+        tend_tf1 = df_tf1['Close'].iloc[-1] > df_tf1['EMA'].iloc[-1]
+        tend_tf2 = df_tf2['Close'].iloc[-1] > df_tf2['EMA'].iloc[-1]
+
+        tend_alc = tend_tf1 and (tend_tf2 if EXIGIR_MACRO else True)
+        tend_baj = (not tend_tf1) and ((not tend_tf2) if EXIGIR_MACRO else True)
+        grado_a = tend_tf1 == tend_tf2
+
+        return tend_alc, tend_baj, grado_a
+    except Exception as e:
+        print(f"Error verificando filtro macro: {e}")
+        return True, True, False
 
 # ==============================================================================
-# 3. EVALUACIÓN Y RESAMPLING DE TIMEFRAMES
+# 3. ENDPOINTS HTTP Y PROCESAMIENTO WEBHOOK
 # ==============================================================================
-def evaluar_tf(tf: str):
-    # Determinar qué intervalo descargar de Yahoo Finance
-    if tf in ["2m", "5m", "15m", "30m"]:
-        intervalo_yf = tf
-        periodo = "5d"
-    elif tf in ["60m", "3h", "4h"]:
-        intervalo_yf = "60m"
-        periodo = "60d"
-    else:
-        intervalo_yf = tf
-        periodo = "2y"
-        
-    df = yf.download(SYMBOL, period=periodo, interval=intervalo_yf, progress=False)
-    df_tf1 = yf.download(SYMBOL, period="60d", interval=TF1, progress=False)
-    df_tf2 = yf.download(SYMBOL, period="120d", interval=TF2, progress=False)
-    
-    if df.empty or df_tf1.empty or df_tf2.empty:
-        return
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def catch_all(path):
+    return "Bot Sweeper QUANT v3 (Webhook Engine) activo y escuchando.", 200
 
-    # Limpiar jerarquía de columnas si yfinance devuelve MultiIndex
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-        df_tf1.columns = df_tf1.columns.get_level_values(0)
-        df_tf2.columns = df_tf2.columns.get_level_values(0)
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    try:
+        data = request.get_json(force=True, silent=True)
+        if not data:
+            return jsonify({"status": "error", "message": "Payload JSON inválido o vacío"}), 400
 
-    # Resampling personalizado para 3H y 4H desde las velas de 1H
-    if tf in ["3h", "4h"]:
-        rule = "3h" if tf == "3h" else "4h"
-        df = df.resample(rule).agg({
-            'Open': 'first',
-            'High': 'max',
-            'Low': 'min',
-            'Close': 'last',
-            'Volume': 'sum'
-        }).dropna()
+        # Extraer campos de la alerta de TradingView
+        ticker = data.get("ticker", SYMBOL)
+        timeframe = data.get("timeframe", "3M")
+        direccion = data.get("action", "").upper()  # "BUY" o "SELL"
+        tipo_senal = data.get("type", "BARRIDO")    # "BARRIDO" o "BOS"
+        precio = float(data.get("price", 0))
+        swing_level = float(data.get("invalidation", 0))
 
-    # Filtro Macro Trend (TF1 / TF2)
-    df_tf1['EMA'] = ta.ema(df_tf1['Close'], length=EMA_LEN)
-    df_tf2['EMA'] = ta.ema(df_tf2['Close'], length=EMA_LEN)
-    
-    tend_tf1 = df_tf1['Close'].iloc[-1] > df_tf1['EMA'].iloc[-1]
-    tend_tf2 = df_tf2['Close'].iloc[-1] > df_tf2['EMA'].iloc[-1]
-    
-    tend_alc = tend_tf1 and (tend_tf2 if EXIGIR_MACRO else True)
-    tend_baj = (not tend_tf1) and ((not tend_tf2) if EXIGIR_MACRO else True)
-    grado_a = tend_tf1 == tend_tf2
+        ahora_utc = datetime.datetime.now(pytz.utc)
 
-    # Veto por Volumen HTF
-    df_vol = yf.download(SYMBOL, period="30d", interval=TF_VOL, progress=False)
-    if isinstance(df_vol.columns, pd.MultiIndex):
-        df_vol.columns = df_vol.columns.get_level_values(0)
-        
-    df_vol['VolMA'] = ta.sma(df_vol['Volume'], length=VOL_LEN)
-    df_vol['CLV'] = calcular_clv(df_vol)
-    
-    vol_htf, vol_ma, clv_htf = df_vol['Volume'].iloc[-1], df_vol['VolMA'].iloc[-1], df_vol['CLV'].iloc[-1]
-    veto_long = (vol_htf > vol_ma * MULT_VOL) and (clv_htf < -CLV_MIN)
-    veto_short = (vol_htf > vol_ma * MULT_VOL) and (clv_htf > CLV_MIN)
+        # 1. Validar filtro de sesión
+        if not esta_en_sesion(ahora_utc):
+            print(f"[{ahora_utc}] Señal ignorada: Fuera de horario de sesión (Londres/NY).")
+            return jsonify({"status": "ignored", "reason": "Fuera de sesion"}), 200
 
-    # Cálculo técnico en el DataFrame del Timeframe objetivo
-    df['CLV'] = calcular_clv(df)
-    df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-    df['SwingHigh'], df['SwingLow'] = obtener_pivotes(df, LEN_PIVOTE, LEN_PIVOTE)
+        # 2. Validar tendencia Macro (HTF)
+        tend_alc, tend_baj, grado_a = validar_filtro_macro()
 
-    if len(df) < 4:
-        return
+        if direccion == "BUY" and not tend_alc:
+            print(f"[{ahora_utc}] Señal LONG rechazada por filtro macro HTF.")
+            return jsonify({"status": "ignored", "reason": "Macro tendencia bajista"}), 200
 
-    c_vela, p_vela = df.iloc[-2], df.iloc[-3]
-    en_sesion = esta_en_sesion(df.index[-2]) if tf in ["2m", "5m", "15m", "30m", "60m"] else True
-    
-    clv_trig = c_vela['CLV']
-    disp_alc, disp_baj = clv_trig >= CLV_TRIG_MIN, clv_trig <= -CLV_TRIG_MIN
+        if direccion == "SELL" and not tend_baj:
+            print(f"[{ahora_utc}] Señal SHORT rechazada por filtro macro HTF.")
+            return jsonify({"status": "ignored", "reason": "Macro tendencia alcista"}), 200
 
-    swing_low, swing_high = c_vela['SwingLow'], c_vela['SwingHigh']
-    sweep_low = pd.notna(swing_low) and (c_vela['Low'] < swing_low) and (c_vela['Close'] > swing_low)
-    sweep_high = pd.notna(swing_high) and (c_vela['High'] > swing_high) and (c_vela['Close'] < swing_high)
-    bos_up = pd.notna(swing_high) and (c_vela['Close'] > swing_high) and (p_vela['Close'] <= swing_high)
-    bos_dn = pd.notna(swing_low) and (c_vela['Close'] < swing_low) and (p_vela['Close'] >= swing_low)
+        # 3. Calcular targets de parciales
+        rango_est = abs(precio - swing_level) if swing_level > 0 else 4.0
+        grado_str = "(A+)" if grado_a else "(B)"
 
-    sig_long = en_sesion and (not veto_long) and tend_alc and disp_alc and ((MODO_BARRIDO and sweep_low) or (MODO_BOS and bos_up))
-    sig_short = en_sesion and (not veto_short) and tend_baj and disp_baj and ((MODO_BARRIDO and sweep_high) or (MODO_BOS and bos_dn))
+        if direccion == "BUY":
+            tp1 = precio + (rango_est * 0.15)
+            tp2 = precio + (rango_est * 0.20)
+            msg = (
+                f"🔥 *SEÑAL {tipo_senal} LONG {grado_str}*\n"
+                f"⏱️ *Timeframe:* `{timeframe}`\n"
+                f"📈 *Activo:* {ticker}\n"
+                f"💲 *Precio Entrada:* `{precio:.2f}`\n"
+                f"🎯 *Parcial TP1 (15%):* `{tp1:.2f}`\n"
+                f"🎯 *Parcial TP2 (20%):* `{tp2:.2f}`\n"
+                f"🛡️ *Inval. Estructural:* `{swing_level:.2f}`"
+            )
+        else:
+            tp1 = precio - (rango_est * 0.15)
+            tp2 = precio - (rango_est * 0.20)
+            msg = (
+                f"🚨 *SEÑAL {tipo_senal} SHORT {grado_str}*\n"
+                f"⏱️ *Timeframe:* `{timeframe}`\n"
+                f"📉 *Activo:* {ticker}\n"
+                f"💲 *Precio Entrada:* `{precio:.2f}`\n"
+                f"🎯 *Parcial TP1 (15%):* `{tp1:.2f}`\n"
+                f"🎯 *Parcial TP2 (20%):* `{tp2:.2f}`\n"
+                f"🛡️ *Inval. Estructural:* `{swing_level:.2f}`"
+            )
 
-    # Mapeo de etiqueta limpia para el mensaje de Telegram
-    tf_map = {
-        "2m": "3M",
-        "5m": "5M",
-        "15m": "15M",
-        "30m": "30M",
-        "60m": "1H",
-        "3h": "3H",
-        "4h": "4H",
-        "1d": "1D",
-        "1wk": "1W",
-        "1mo": "1M"
-    }
-    tf_label = tf_map.get(tf, tf.upper())
-
-    if sig_long:
-        tipo = "BARRIDO LONG" if (MODO_BARRIDO and sweep_low) else "🚀 CONTINUACIÓN LONG"
-        grado = "(A+)" if grado_a else "(B)"
-        me = max(swing_high - swing_low if pd.notna(swing_high) and pd.notna(swing_low) else 4.0 * c_vela['ATR'], 2.0 * c_vela['ATR'])
-        msg = (
-            f"🔥 *SEÑAL {tipo} {grado}*\n"
-            f"⏱️ *Timeframe:* `{tf_label}`\n"
-            f"📈 *Activo:* {SYMBOL}\n"
-            f"💲 *Precio Entrada:* `{c_vela['Close']:.2f}`\n"
-            f"🎯 *Parcial TP1 (15%):* `{c_vela['Close'] + (me * 0.15):.2f}`\n"
-            f"🎯 *Parcial TP2 (20%):* `{c_vela['Close'] + (me * 0.20):.2f}`\n"
-            f"🛡️ *Inval. Estructural:* `{swing_low:.2f}`"
-        )
         enviar_telegram(msg)
+        return jsonify({"status": "success", "message": "Alerta procesada y enviada"}), 200
 
-    elif sig_short:
-        tipo = "🎯 BARRIDO SHORT" if (MODO_BARRIDO and sweep_high) else "🚀 CONTINUACIÓN SHORT"
-        grado = "(A+)" if grado_a else "(B)"
-        me = max(swing_high - swing_low if pd.notna(swing_high) and pd.notna(swing_low) else 4.0 * c_vela['ATR'], 2.0 * c_vela['ATR'])
-        msg = (
-            f"🚨 *SEÑAL {tipo} {grado}*\n"
-            f"⏱️ *Timeframe:* `{tf_label}`\n"
-            f"📉 *Activo:* {SYMBOL}\n"
-            f"💲 *Precio Entrada:* `{c_vela['Close']:.2f}`\n"
-            f"🎯 *Parcial TP1 (15%):* `{c_vela['Close'] - (me * 0.15):.2f}`\n"
-            f"🎯 *Parcial TP2 (20%):* `{c_vela['Close'] - (me * 0.20):.2f}`\n"
-            f"🛡️ *Inval. Estructural:* `{swing_high:.2f}`"
-        )
-        enviar_telegram(msg)
-
-def analizar_mercado():
-    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Escaneando {SYMBOL} en múltiples Timeframes...")
-    for tf in TIMEFRAMES:
-        try:
-            evaluar_tf(tf)
-        except Exception as e:
-            print(f"Error evaluando TF {tf}: {e}")
+    except Exception as e:
+        print(f"Error procesando webhook: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 # ==============================================================================
-# 4. BUCLE PRINCIPAL CON MULTITHREADING
+# 4. ARRANQUE DEL SERVIDOR
 # ==============================================================================
 if __name__ == "__main__":
-    t = threading.Thread(target=iniciar_servidor_web, daemon=True)
-    t.start()
-
-    while True:
-        try:
-            analizar_mercado()
-        except Exception as e:
-            print(f"Error en bucle principal: {e}")
-        
-        # Bucle de escaneo cada 3 minutos (180 segundos)
-        time.sleep(180)
+    puerto = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=puerto)
